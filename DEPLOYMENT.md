@@ -35,8 +35,8 @@ GEMINI_API_KEY=your_api_key_here
 ### Step 1 — Clone the Repo
 
 ```bash
-git clone <repo-url>
-cd <repo-folder>
+git clone https://github.com/Thejasuryachar11/rooman_ai_agent_task.git
+cd rooman_ai_agent_task
 ```
 
 ### Step 2 — Create and Activate Virtual Environment
