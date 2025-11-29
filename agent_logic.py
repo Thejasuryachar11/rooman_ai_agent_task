@@ -1,90 +1,105 @@
+# agent_logic.py
+"""
+SupportAgent with safe/robust Gemini integration.
+
+- If google.generativeai is not installed or GEMINI_API_KEY is missing, the agent
+  runs in fallback mode (FAQ + local behavior) and does NOT crash the app.
+- When the SDK + key are available, the agent auto-selects a model and uses
+  a resilient caller to attempt different call signatures.
+"""
+
 import os
 from typing import Optional, Tuple, List
 from fuzzywuzzy import fuzz
 
-# google-generativeai SDK
-import google.generativeai as genai
+# Try to import the Gemini SDK; handle gracefully if not present.
+try:
+    import google.generativeai as genai  # type: ignore
+    GEMINI_SDK_AVAILABLE = True
+except Exception as e:
+    genai = None  # type: ignore
+    GEMINI_SDK_AVAILABLE = False
+    print("[agent_logic] google.generativeai not available:", repr(e))
 
-# optional dotenv
+# optional dotenv (non-fatal)
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except Exception:
     pass
 
+# Read API key from env
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+
+# Configure genai only if available and key present
+if GEMINI_SDK_AVAILABLE and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print("[agent_logic] genai.configure failed:", repr(e))
+        GEMINI_SDK_AVAILABLE = False
 
 # Preferred generation method names (try in order)
 PREFERRED_METHODS = [
-    "generate_content",  # newer SDK style (method name on model object)
-    "generateContent",   # some SDKs expose camelCase support list
+    "generate_content",
+    "generateContent",
     "generate_text",
     "generateText",
-    "generate",          # generic
+    "generate",
 ]
 
 # Candidate model name filters (preference order)
-PREFERRED_MODEL_KEYWORDS = [
-    "gemini", "chat-bison", "text-bison", "bison", "gpt", "llama"
-]
+PREFERRED_MODEL_KEYWORDS = ["gemini", "chat-bison", "text-bison", "bison", "gpt", "llama"]
 
 
 def _select_model_and_method() -> Tuple[Optional[str], Optional[str]]:
     """
-    Query genai.list_models() and pick a model name and the supported method to call.
-    Returns (model_name, method_name) or (None, None) if none found.
+    Query genai.list_models() and pick a model name and a supported method.
+    If genai isn't available, return (None, None).
     """
-    try:
-        models = genai.list_models()
-    except Exception:
+    if not GEMINI_SDK_AVAILABLE:
         return None, None
 
-    # Build candidates list with (priority, model_obj)
+    try:
+        models = genai.list_models()
+    except Exception as e:
+        print("[agent_logic] list_models() failed:", repr(e))
+        return None, None
+
     candidates = []
     for m in models:
+        # model object shape may vary by SDK version; try common attributes
         name = getattr(m, "name", None) or getattr(m, "model", None) or None
         if not name:
             continue
-        # score preference by containing preferred keywords
         score = 0
         lname = name.lower()
         for i, kw in enumerate(PREFERRED_MODEL_KEYWORDS):
             if kw in lname:
                 score += (len(PREFERRED_MODEL_KEYWORDS) - i) * 10
-        # Also try to reward models with many supported methods
         supported = getattr(m, "supported_generation_methods", None) or getattr(m, "generation_methods", None) or []
-        candidates.append((score + len(supported), m))
+        candidates.append((score + (len(supported) if supported else 0), m))
 
-    # sort by score desc
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # For each candidate model, find a supported method we can call
     for _, m in candidates:
         name = getattr(m, "name", None) or getattr(m, "model", None)
         supported = getattr(m, "supported_generation_methods", None) or getattr(m, "generation_methods", None) or []
-        # normalize supported method names for matching
         supported_norm = [str(s) for s in supported]
-        # try preferred method mapping
         for method in PREFERRED_METHODS:
-            # check both snake and camel and case-insensitive
             for s in supported_norm:
                 if method.lower() in s.lower() or s.lower() in method.lower():
-                    # found a compatible method
                     return name, method
-        # fallback: if supported list is non-empty, pick first (and map to a method name)
         if supported_norm:
-            # pick first supported method string as-is
             return name, supported_norm[0]
 
     return None, None
 
 
-# Determine model+method once at import time
+# Determine model+method once on import (if possible)
 _SELECTED_MODEL_NAME, _SELECTED_METHOD = _select_model_and_method()
 
-# For debugging (optional): print is fine when run locally
 if _SELECTED_MODEL_NAME:
     try:
         print(f"[agent_logic] Selected model: {_SELECTED_MODEL_NAME}  method: {_SELECTED_METHOD}")
@@ -92,7 +107,7 @@ if _SELECTED_MODEL_NAME:
         pass
 else:
     try:
-        print("[agent_logic] No suitable Gemini model found at startup; agent will use graceful fallbacks.")
+        print("[agent_logic] No suitable Gemini model found at startup; running in fallback mode.")
     except Exception:
         pass
 
@@ -103,20 +118,21 @@ class SupportAgent:
         self.escalation_threshold = 0.6
         self.model_name = _SELECTED_MODEL_NAME
         self.method_name = _SELECTED_METHOD
-        self.llm_available = bool(self.model_name and GEMINI_API_KEY)
-
+        # llm_available only if SDK + key + selected model exist
+        self.llm_available = bool(GEMINI_SDK_AVAILABLE and GEMINI_API_KEY and self.model_name)
         self.system_instruction = (
             "You are a friendly, expert AI assistant. Answer conversationally like ChatGPT. "
             "Ask clarification questions when helpful and offer follow-up help."
         )
 
+        if not self.llm_available:
+            print("[agent_logic] LLM is NOT available. Agent will use FAQ/local fallbacks.")
+
     # -----------------------
     # helpers
     # -----------------------
     def _is_greeting(self, query: str) -> bool:
-        return query.strip().lower() in {
-            "hi", "hello", "hey", "hii", "hola", "yo", "hiya"
-        }
+        return query.strip().lower() in {"hi", "hello", "hey", "hii", "hola", "yo", "hiya"}
 
     def find_matching_faq(self, query: str) -> Tuple[Optional[dict], float]:
         best_match = None
@@ -133,18 +149,29 @@ class SupportAgent:
 
     def detect_escalation_keywords(self, query: str) -> bool:
         keywords = [
-            "urgent", "critical", "emergency", "asap", "immediately",
-            "broken", "not working", "error", "angry", "refund",
-            "cancel", "speak to", "human", "manager", "lawsuit"
+            "urgent",
+            "critical",
+            "emergency",
+            "asap",
+            "immediately",
+            "broken",
+            "not working",
+            "error",
+            "angry",
+            "refund",
+            "cancel",
+            "speak to",
+            "human",
+            "manager",
+            "lawsuit",
         ]
         q = query.lower()
         return any(k in q for k in keywords)
 
     # -----------------------
-    # call Gemini robustly
+    # call Gemini robustly (only used if llm_available True)
     # -----------------------
     def _call_model(self, prompt: str) -> str:
-
         if not self.llm_available:
             raise RuntimeError("Gemini model not configured or API key missing")
 
@@ -155,34 +182,23 @@ class SupportAgent:
         except Exception:
             model = None
 
-        # helper to parse many response shapes into text
         def _extract_text(resp):
-            # direct string
             if isinstance(resp, str):
                 return resp
-            # object-like with .text
             if hasattr(resp, "text") and isinstance(resp.text, str):
                 return resp.text
-            # some resp types use .content or .output or .outputs
             if hasattr(resp, "content") and isinstance(resp.content, str):
                 return resp.content
-            # dict-like
             if isinstance(resp, dict):
-                # common keys
                 for k in ("text", "content", "output", "outputs", "candidates", "message", "messages"):
                     if k in resp:
                         val = resp[k]
-                        # if list -> try to dig
                         if isinstance(val, list) and val:
-                            # try nested dicts
                             first = val[0]
                             if isinstance(first, dict):
-                                # try keys inside
                                 for kk in ("text", "content", "message"):
                                     if kk in first and isinstance(first[kk], str):
                                         return first[kk]
-                                # maybe nested outputs
-                                # try to stringify
                                 try:
                                     return str(first)
                                 except Exception:
@@ -191,24 +207,19 @@ class SupportAgent:
                                 return first
                         elif isinstance(val, str):
                             return val
-                # last resort: try to stringify dict (not ideal)
                 try:
                     return str(resp)
                 except Exception:
                     pass
-            # object with outputs attr (list)
             if hasattr(resp, "outputs"):
                 outputs = getattr(resp, "outputs")
                 if outputs:
                     out0 = outputs[0]
-                    # nested content field
                     if hasattr(out0, "text") and isinstance(out0.text, str):
                         return out0.text
-                    # maybe out0.content[0].text
                     if hasattr(out0, "content"):
                         try:
                             c = out0.content
-                            # if list with dicts
                             if isinstance(c, list) and c:
                                 first = c[0]
                                 if isinstance(first, dict):
@@ -217,12 +228,10 @@ class SupportAgent:
                                             return first[kk]
                         except Exception:
                             pass
-            # object with 'candidates' attr (like some responses)
             if hasattr(resp, "candidates"):
                 cands = getattr(resp, "candidates")
                 if isinstance(cands, list) and cands:
                     cand0 = cands[0]
-                    # maybe cand0["output"] or cand0.text
                     if isinstance(cand0, dict):
                         for kk in ("output", "content", "text"):
                             if kk in cand0 and isinstance(cand0[kk], str):
@@ -231,19 +240,9 @@ class SupportAgent:
                         return cand0.text
             return None
 
-        # Build a list of call attempts: (callable, kwargs or positional)
         attempts = []
 
-        # If model object exists, try various methods on model
         if model is not None:
-            method_names = []
-            try:
-                # inspect attributes of model
-                method_names = [m for m in dir(model) if not m.startswith("_")]
-            except Exception:
-                method_names = []
-
-            # common method names and keyword shapes to try
             method_variants = [
                 ("generate_content", {"prompt": prompt}),
                 ("generate_content", {"input": prompt}),
@@ -264,14 +263,11 @@ class SupportAgent:
                 if hasattr(model, method):
                     func = getattr(model, method)
                     attempts.append((func, kwargs))
-
-            # also try positional single-arg calls (func(prompt))
             for method, _ in method_variants:
                 if hasattr(model, method):
                     func = getattr(model, method)
                     attempts.append((func, (prompt,)))
 
-        # Top-level genai helper fallbacks
         top_level_variants = [
             ("generate_content", {"model": self.model_name, "prompt": prompt}),
             ("generate_content", {"model": self.model_name, "input": prompt}),
@@ -285,50 +281,42 @@ class SupportAgent:
             ("create", {"model": self.model_name, "prompt": prompt}),
         ]
         for fname, kwargs in top_level_variants:
-            if hasattr(genai, fname):
+            if GEMINI_SDK_AVAILABLE and hasattr(genai, fname):
                 attempts.append((getattr(genai, fname), kwargs))
 
-        # Finally try genai.generate or genai.generate_text even if not listed
         generic_fallbacks = [
-            (getattr(genai, "generate", None), {"model": self.model_name, "prompt": prompt}),
-            (getattr(genai, "generate_text", None), {"model": self.model_name, "prompt": prompt}),
-            (getattr(genai, "generate_content", None), {"model": self.model_name, "prompt": prompt}),
+            (getattr(genai, "generate", None), {"model": self.model_name, "prompt": prompt}) if GEMINI_SDK_AVAILABLE else (None, None),
+            (getattr(genai, "generate_text", None), {"model": self.model_name, "prompt": prompt}) if GEMINI_SDK_AVAILABLE else (None, None),
+            (getattr(genai, "generate_content", None), {"model": self.model_name, "prompt": prompt}) if GEMINI_SDK_AVAILABLE else (None, None),
         ]
         for f, kw in generic_fallbacks:
             if f:
                 attempts.append((f, kw))
 
         errors = []
-        # Try all attempts
         for func, args in attempts:
-            if func is None:
+            if not func:
                 continue
             try:
-                # If args is tuple => positional call
                 if isinstance(args, tuple):
                     resp = func(*args)
                 elif isinstance(args, dict):
                     try:
                         resp = func(**args)
                     except TypeError:
-                        # try positional fallback
                         try:
                             resp = func(args)
-                        except Exception as e:
+                        except Exception:
                             raise
                 else:
-                    # unknown args shape, try simple call
                     resp = func(prompt)
             except Exception as e:
                 errors.append(e)
                 continue
 
-            # parse response
             text = _extract_text(resp)
             if text:
                 return text
-
-            # if not parsed, record raw resp as fallback string
             try:
                 s = str(resp)
                 if s and s.strip() and len(s.strip()) > 10:
@@ -336,7 +324,6 @@ class SupportAgent:
             except Exception:
                 pass
 
-        # If we reach here, all attempts failed
         last_err = errors[-1] if errors else None
         raise RuntimeError(f"All model call attempts failed. Last error: {repr(last_err)}")
 
@@ -354,7 +341,7 @@ class SupportAgent:
                 "Hi there! 👋 I'm your assistant — how can I help today?",
                 False,
                 None,
-                ["Check FAQs", "Report an issue", "Talk to a human"]
+                ["Check FAQs", "Report an issue", "Talk to a human"],
             )
 
         # Escalation detection
@@ -363,7 +350,7 @@ class SupportAgent:
                 "This looks urgent. I'm escalating this to a human support agent.",
                 True,
                 "Contains urgent/critical keywords",
-                None
+                None,
             )
 
         # FAQ matching
@@ -393,14 +380,12 @@ class SupportAgent:
                 if answer_text and answer_text.strip():
                     return answer_text.strip(), False, None, None
             except Exception as e:
-                # log by printing (optional)
                 try:
                     print("[agent_logic] model call failed:", repr(e))
                 except Exception:
                     pass
-                # fallback to FAQ or friendly fallback below
 
-        # Fallbacks: prefer FAQ answer if medium confidence, else helpful fallback
+        # Medium-confidence FAQ fallback
         if faq and confidence >= 0.5:
             reply = (
                 f"It looks like this FAQ might help:\n\nQ: {faq.get('question')}\nA: {faq.get('answer')}\n\n"
